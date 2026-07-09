@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import tyro
 import wandb
+import tqdm
 from torch.utils.data import DataLoader
 
 from hw1_imitation.data import (
@@ -20,7 +21,7 @@ from hw1_imitation.data import (
     load_pusht_zarr,
 )
 from hw1_imitation.model import build_policy, PolicyType
-from hw1_imitation.evaluation import Logger
+from hw1_imitation.evaluation import Logger, evaluate_policy
 
 LOGDIR_PREFIX = "exp"
 
@@ -31,7 +32,7 @@ class TrainConfig:
     data_dir: Path = Path("data")
 
     # The policy type -- either MSE or flow.
-    policy_type: PolicyType = "mse"
+    policy_type: PolicyType = "flow"
     # The number of denoising steps to use for the flow policy (has no effect for the MSE policy).
     flow_num_steps: int = 10
     # The action chunk size.
@@ -127,7 +128,57 @@ def run_training(config: TrainConfig) -> None:
     )
     logger = Logger(log_dir)
 
-    ### TODO: PUT YOUR MAIN TRAINING LOOP HERE ###
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+
+    def train_step(state: torch.Tensor, action_chunk: torch.Tensor) -> torch.Tensor:
+        loss = model.compute_loss(state.to(device), action_chunk.to(device))
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        return loss
+    
+    if device.type == "cuda":
+        train_step = torch.compile(train_step)
+
+    global_step = 0
+
+    for ep in tqdm.tqdm(range(config.num_epochs), desc="Training"):
+        for batch_idx, (state, action_chunk) in enumerate(loader):
+            loss = train_step(state, action_chunk)
+
+            if global_step % config.log_interval == 0:
+                logger.log(
+                    {
+                        "Training/Epoch": ep, 
+                        "Training/Loss": float(loss.item())
+                    }, 
+                    step=global_step
+                )
+            
+            if global_step % config.eval_interval == 0:
+                evaluate_policy(
+                    model = model, 
+                    normalizer = normalizer, 
+                    device = device, 
+                    chunk_size = config.chunk_size,
+                    video_size = config.video_size,
+                    num_video_episodes = config.num_video_episodes,
+                    flow_num_steps = config.flow_num_steps,
+                    step = global_step,
+                    logger = logger
+                )
+            
+            wandb_data = {
+                "Training/Loss": float(loss.item()),
+                "Training/Epoch": ep,
+                "Training/Batch": batch_idx,
+                "Training/Step": global_step,
+                "Training/lr": float(optimizer.param_groups[0]['lr'])
+            }
+
+            wandb.log(wandb_data, step=global_step)
+            
+            global_step += 1
 
     logger.dump_for_grading()
 
